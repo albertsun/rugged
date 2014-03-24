@@ -1,26 +1,6 @@
 require "test_helper"
 require 'net/http'
 
-class RemoteNetworkTest < Rugged::TestCase
-  include Rugged::RepositoryAccess
-
-  def test_remote_network_connect
-    begin
-      Net::HTTP.new('github.com').head('/')
-    rescue SocketError => msg
-      skip "github is not reachable: #{msg}"
-    end
-
-    remote = Rugged::Remote.new(@repo, 'git://github.com/libgit2/libgit2.git')
-
-    remote.connect(:fetch) do |r|
-      assert r.connected?
-    end
-
-    assert !remote.connected?
-  end
-end
-
 class RemoteTest < Rugged::TestCase
   include Rugged::RepositoryAccess
 
@@ -181,15 +161,19 @@ class RemotePushTest < Rugged::SandboxedTestCase
   def test_push_to_non_bare_raise_error
     @remote_repo.config['core.bare'] = 'false'
 
-    assert_raises Rugged::InvalidError do
+    exception = assert_raises Rugged::InvalidError do
       @remote.push(["refs/heads/master"])
     end
+
+    assert_equal "Local push doesn't (yet) support pushing to non-bare repos.", exception.message
   end
 
   def test_push_non_forward_raise_error
-    assert_raises Rugged::Error do
+    exception = assert_raises Rugged::ReferenceError do
       @remote.push(["refs/heads/unit_test:refs/heads/master"])
     end
+
+    assert_equal "Cannot push non-fastforwardable reference", exception.message
 
     assert_equal "a65fedf39aefe402d3bb6e24df4d4f5fe4547750", @remote_repo.ref("refs/heads/master").target_id
   end
@@ -269,61 +253,22 @@ class RemoteTransportTest < Rugged::TestCase
     FileUtils.remove_entry_secure(@path)
   end
 
-  def test_remote_disconnect
-    @remote.connect(:fetch)
-    assert @remote.connected?
-
-    @remote.disconnect
-    refute @remote.connected?
-  end
-
   def test_remote_ls
-    @remote.connect(:fetch) do |r|
-      assert r.ls.kind_of? Enumerable
-      rheads = r.ls.to_a
+    result = @remote.ls
+    assert result.kind_of? Enumerable
 
-      assert_equal 7, rheads.count
+    rheads = result.to_a
 
-      rhead = rheads.first
-      assert_equal false, rhead[:local?]
-      assert rhead[:oid]
-      assert_nil rhead[:loid]
-    end
-  end
+    assert_equal 7, rheads.count
 
-  def test_update_tips_callback
-    @remote.connect(:fetch) do |r|
-      r.download
-      r.update_tips! do |ref, source, destination|
-        assert @repo.references[ref]
-        assert_nil source
-        assert destination
-      end
-    end
-  end
-
-  # this is not as useless as it seems
-  # LocalJumpError is raised in the second call to
-  # update_tips! if libgit2 callback is not cleared
-  # Also the exception is explicitly raised after the
-  # callback is cleared
-  def test_update_tips_cleanup_callbacks
-    @remote.connect(:fetch) do |r|
-      r.download
-      assert_raises TestException do
-        r.update_tips! do
-          raise TestException
-        end
-      end
-      r.update_tips!
-    end
+    rhead = rheads.first
+    assert_equal false, rhead[:local?]
+    assert rhead[:oid]
+    assert_nil rhead[:loid]
   end
 
   def test_remote_fetch
-    @remote.connect(:fetch) do |r|
-      r.download
-      r.update_tips!
-    end
+    @remote.fetch
 
     assert_equal '36060c58702ed4c2a40832c51758d5344201d89a', @repo.rev_parse('origin/master').oid
     assert @repo.lookup('36060c5')

@@ -26,6 +26,12 @@
 
 extern VALUE rb_mRugged;
 extern VALUE rb_cRuggedRepo;
+extern VALUE rb_eRuggedError;
+
+extern VALUE rb_cRuggedCredPlaintext;
+extern VALUE rb_cRuggedCredSshKey;
+extern VALUE rb_cRuggedCredDefault;
+
 VALUE rb_cRuggedRemote;
 
 static void rb_git_remote__free(git_remote *remote)
@@ -242,9 +248,7 @@ static VALUE rugged_rhead_new(const git_remote_head *head)
  *  +Hash+.
  *  If no block is given an Enumerator is returned.
  *
- *    remote.connect(:fetch) do |r|
- *      r.ls.to_a #=> [{:local?=>false, :oid=>"b3ee97a91b02e91c35394950bda6ea622044baad", :loid=> nil, :name=>"refs/heads/development"}]
- *    end
+ *    remote.ls.to_a #=> [{:local?=>false, :oid=>"b3ee97a91b02e91c35394950bda6ea622044baad", :loid=> nil, :name=>"refs/heads/development"}]
  *
  *  remote head hash includes:
  *  [:oid] oid of the remote head
@@ -263,14 +267,20 @@ static VALUE rb_git_remote_ls(VALUE self)
 	if (!rb_block_given_p())
 		return rb_funcall(self, rb_intern("to_enum"), 1, CSTR2SYM("ls"));
 
+	error = git_remote_connect(remote, GIT_DIRECTION_FETCH);
+	rugged_exception_check(error);
+
 	error = git_remote_ls(&heads, &heads_len, remote);
 
 	for (i = 0; i < heads_len && !exception; i++) {
 		rb_protect(rb_yield, rugged_rhead_new(heads[i]), &exception);
-   	}
+	}
+
+	git_remote_disconnect(remote);
 
 	if (exception)
 		rb_jump_tag(exception);
+
 	rugged_exception_check(error);
 
 	return Qnil;
@@ -474,111 +484,6 @@ static VALUE rb_git_remote_clear_refspecs(VALUE self)
 
 /*
  *  call-seq:
- *    remote.connected? -> true or false
- *
- *  Returns if the remote is connected
- *
- *    remote.connected? #=> false
- *    remote.connect(:fetch)
- *    remote.connected? #=> true
- */
-static VALUE rb_git_remote_connected(VALUE self)
-{
-	git_remote *remote;
-	Data_Get_Struct(self, git_remote, remote);
-
-	return git_remote_connected(remote) ? Qtrue : Qfalse;
-}
-
-/*
- *  call-seq:
- *    remote.download() -> nil
- *
- *  Download the packfile from a connected remote
- *
- *  Negotiate what objects should be downloaded and download the
- *  packfile with those objects.
- *
- *    remote.connect(:fetch) do |r|
- *      r.download
- *    end
- */
-static VALUE rb_git_remote_download(VALUE self)
-{
-	int error;
-	git_remote *remote;
-
-	Data_Get_Struct(self, git_remote, remote);
-
-	error = git_remote_download(remote);
-	rugged_exception_check(error);
-
-	return Qnil;
-}
-
-static int cb_remote__update_tips(const char *refname, const git_oid *src, const git_oid *dest, void *payload)
-{
-	VALUE rb_args = rb_ary_new2(3);
-	int *exception = (int *)payload;
-	rb_ary_push(rb_args, rb_str_new_utf8(refname));
-	rb_ary_push(rb_args, git_oid_iszero(src) ? Qnil : rugged_create_oid(src));
-	rb_ary_push(rb_args, git_oid_iszero(dest) ? Qnil : rugged_create_oid(dest));
-
-	rb_protect(rb_yield_splat, rb_args, exception);
-
-	return *exception ? GIT_ERROR : GIT_OK;
-}
-
-/*
- *  call-seq:
- *    remote.update_tips! -> nil
- *    remote.update_tips! { |reference, source, destination| block }
- *
- *  Update the tips to a new state from a connected remote. The target
- *  objects must be downloaded before the tips are updated.
- *
- *      r.update_tips! do |ref, src, dst|
- *        puts "#{ref}: #{src}..#{dst}"
- *      end
- */
-static VALUE rb_git_remote_update_tips(VALUE self)
-{
-	git_remote *remote;
-
-	Data_Get_Struct(self, git_remote, remote);
-
-	if (rb_block_given_p()) {
-		int exception = 0, error;
-		git_remote_callbacks callbacks = GIT_REMOTE_CALLBACKS_INIT;
-
-		callbacks.payload = &exception;
-		callbacks.update_tips = &cb_remote__update_tips;
-		rugged_exception_check(
-			git_remote_set_callbacks(remote, &callbacks)
-		);
-
-		error = git_remote_update_tips(remote, NULL, NULL);
-
-		callbacks.update_tips = NULL;
-		// Don't overwrite the first error we've seen
-		if (!error) error = git_remote_set_callbacks(remote, &callbacks);
-		else git_remote_set_callbacks(remote, &callbacks);
-
-		if (exception)
-			rb_jump_tag(exception);
-
-		rugged_exception_check(error);
-	} else {
-		rugged_exception_check(
-			git_remote_update_tips(remote, NULL, NULL)
-		);
-	}
-
-	return Qnil;
-}
-
-/*
- *  call-seq:
  *    Remote.names(repository) -> array
  *
  *  Returns the names of all remotes in +repository+
@@ -707,6 +612,483 @@ static VALUE rb_git_remote_rename(VALUE self, VALUE rb_new_name)
 	return RARRAY_LEN(rb_refspec_ary) == 0 ? Qnil : rb_refspec_ary;
 }
 
+static int rugged__remote_transfer_progress_cb(const git_transfer_progress *stats, void *payload)
+{
+	struct rugged_remote_cb_payload *remote_payload = payload;
+	VALUE args = rb_ary_new2(5);
+
+	rb_ary_push(args, remote_payload->transfer_progress);
+	rb_ary_push(args, UINT2NUM(stats->total_objects));
+	rb_ary_push(args, UINT2NUM(stats->indexed_objects));
+	rb_ary_push(args, UINT2NUM(stats->received_objects));
+	rb_ary_push(args, UINT2NUM(stats->local_objects));
+	rb_ary_push(args, UINT2NUM(stats->total_deltas));
+	rb_ary_push(args, UINT2NUM(stats->indexed_deltas));
+	rb_ary_push(args, INT2FIX(stats->received_bytes));
+
+	rb_protect(rugged__block_yield_splat, args, &remote_payload->exception);
+
+	return remote_payload->exception ? GIT_ERROR : GIT_OK;
+}
+
+static int rugged__remote_progress_cb(const char *str, int len, void *payload)
+{
+	struct rugged_remote_cb_payload *remote_payload = payload;
+	VALUE args = rb_ary_new2(2);
+
+	rb_ary_push(args, remote_payload->progress);
+	rb_ary_push(args, rb_str_new(str, len));
+
+	rb_protect(rugged__block_yield_splat, args, &remote_payload->exception);
+
+	return remote_payload->exception ? GIT_ERROR : GIT_OK;
+}
+
+static int rugged__remote_update_tips_cb(const char *refname, const git_oid *src, const git_oid *dest, void *payload)
+{
+	struct rugged_remote_cb_payload *remote_payload = payload;
+	VALUE args = rb_ary_new2(4);
+
+	rb_ary_push(args, remote_payload->update_tips);
+	rb_ary_push(args, rb_str_new_utf8(refname));
+	rb_ary_push(args, git_oid_iszero(src) ? Qnil : rugged_create_oid(src));
+	rb_ary_push(args, git_oid_iszero(dest) ? Qnil : rugged_create_oid(dest));
+
+	rb_protect(rugged__block_yield_splat, args, &remote_payload->exception);
+
+	return remote_payload->exception ? GIT_ERROR : GIT_OK;
+}
+
+struct extract_cred_payload
+{
+	VALUE rb_cred;
+	git_cred **cred;
+	unsigned int allowed_types;
+};
+
+static VALUE rugged__extract_cred(VALUE payload) {
+	struct extract_cred_payload *cred_payload = (struct extract_cred_payload*)payload;
+	git_cred **cred = cred_payload->cred;
+	VALUE rb_cred = cred_payload->rb_cred;
+
+	if (rb_obj_is_kind_of(rb_cred, rb_cRuggedCredPlaintext)) {
+		if (!(cred_payload->allowed_types & GIT_CREDTYPE_USERPASS_PLAINTEXT)) {
+			rb_raise(rb_eArgError, "Invalid credential type");
+		} else {
+			VALUE rb_username = rb_iv_get(rb_cred, "@username");
+			VALUE rb_password = rb_iv_get(rb_cred, "@password");
+
+			Check_Type(rb_username, T_STRING);
+			Check_Type(rb_password, T_STRING);
+
+
+			rugged_exception_check(
+				git_cred_userpass_plaintext_new(cred,
+					StringValueCStr(rb_username), StringValueCStr(rb_password)));
+		}
+	} else if (rb_obj_is_kind_of(rb_cred, rb_cRuggedCredSshKey)) {
+		if (!(cred_payload->allowed_types & GIT_CREDTYPE_SSH_KEY)) {
+			rb_raise(rb_eArgError, "Invalid credential type");
+		} else {
+			VALUE rb_username   = rb_iv_get(rb_cred, "@username");
+			VALUE rb_publickey  = rb_iv_get(rb_cred, "@publickey");
+			VALUE rb_privatekey = rb_iv_get(rb_cred, "@privatekey");
+			VALUE rb_passphrase = rb_iv_get(rb_cred, "@passphrase");
+
+			Check_Type(rb_privatekey, T_STRING);
+
+			if (!NIL_P(rb_username))
+				Check_Type(rb_username, T_STRING);
+			if (!NIL_P(rb_publickey))
+				Check_Type(rb_publickey, T_STRING);
+			if (!NIL_P(rb_passphrase))
+				Check_Type(rb_passphrase, T_STRING);
+
+			rugged_exception_check(
+				git_cred_ssh_key_new(cred,
+					NIL_P(rb_username) ? NULL : StringValueCStr(rb_username),
+					NIL_P(rb_publickey) ? NULL : StringValueCStr(rb_publickey),
+					StringValueCStr(rb_privatekey),
+					NIL_P(rb_passphrase) ? NULL : StringValueCStr(rb_passphrase)));
+		}
+	} else if (rb_obj_is_kind_of(rb_cred, rb_cRuggedCredDefault)) {
+		if (!(cred_payload->allowed_types & GIT_CREDTYPE_SSH_KEY)) {
+			rb_raise(rb_eArgError, "Invalid credential type");
+		} else {
+			rugged_exception_check(git_cred_default_new(cred));
+		}
+	}
+
+	return Qnil;
+}
+
+static int rugged__remote_credentials_cb(
+	git_cred **cred,
+	const char *url,
+	const char *username_from_url,
+	unsigned int allowed_types,
+	void *payload)
+{
+	struct rugged_remote_cb_payload *remote_payload = payload;
+	struct extract_cred_payload cred_payload;
+	VALUE args = rb_ary_new2(4), rb_allowed_types = rb_ary_new();
+
+	if (allowed_types & GIT_CREDTYPE_USERPASS_PLAINTEXT)
+		rb_ary_push(rb_allowed_types, CSTR2SYM("plaintext"));
+
+	if (allowed_types & GIT_CREDTYPE_SSH_KEY)
+		rb_ary_push(rb_allowed_types, CSTR2SYM("ssh_key"));
+
+	if (allowed_types & GIT_CREDTYPE_DEFAULT)
+		rb_ary_push(rb_allowed_types, CSTR2SYM("default"));
+
+	rb_ary_push(args, remote_payload->credentials);
+	rb_ary_push(args, url ? rb_str_new2(url) : Qnil);
+	rb_ary_push(args, username_from_url ? rb_str_new2(username_from_url) : Qnil);
+	rb_ary_push(args, rb_allowed_types);
+
+	cred_payload.cred = cred;
+	cred_payload.rb_cred = rb_protect(rugged__block_yield_splat, args, &remote_payload->exception);
+	cred_payload.allowed_types = allowed_types;
+
+	if (!remote_payload->exception)
+		rb_protect(rugged__extract_cred, (VALUE)&cred_payload, &remote_payload->exception);
+
+	return remote_payload->exception ? GIT_ERROR : GIT_OK;
+}
+
+static int rugged__default_remote_credentials_cb(
+	git_cred **cred,
+	const char *url,
+	const char *username_from_url,
+	unsigned int allowed_types,
+	void *payload)
+{
+	struct rugged_remote_cb_payload *remote_payload = payload;
+	struct extract_cred_payload cred_payload;
+
+	cred_payload.cred = cred;
+	cred_payload.rb_cred = remote_payload->credentials;
+	cred_payload.allowed_types = allowed_types;
+
+	rb_protect(rugged__extract_cred, (VALUE)&cred_payload, &remote_payload->exception);
+
+	return remote_payload->exception ? GIT_ERROR : GIT_OK;
+}
+
+void parse_fetch_options(git_remote_callbacks *callbacks, VALUE rb_options_hash, struct rugged_remote_cb_payload *payload)
+{
+	VALUE val;
+
+	if (NIL_P(rb_options_hash))
+		return;
+
+	val = rb_hash_aref(rb_options_hash, CSTR2SYM("credentials"));
+	if (RTEST(val)) {
+		if (rb_obj_is_kind_of(val, rb_cRuggedCredPlaintext) ||
+			rb_obj_is_kind_of(val, rb_cRuggedCredSshKey) ||
+			rb_obj_is_kind_of(val, rb_cRuggedCredDefault))
+		{
+			callbacks->credentials = rugged__default_remote_credentials_cb;
+			payload->credentials = val;
+		} else if (rb_respond_to(val, rb_intern("call"))) {
+			callbacks->credentials = rugged__remote_credentials_cb;
+			payload->credentials = val;
+		} else {
+			rb_raise(rb_eArgError,
+				"Expected a Rugged::Credentials type, a Proc or an object that responds to call (:credentials).");
+		}
+	}
+
+	val = rb_hash_aref(rb_options_hash, CSTR2SYM("progress"));
+	if (RTEST(val)) {
+		if (!rb_respond_to(val, rb_intern("call"))) {
+			rb_raise(rb_eArgError, "Expected a Proc or an object that responds to call (:progress).");
+		}
+
+		payload->progress = val;
+		callbacks->progress = rugged__remote_progress_cb;
+	}
+
+	val = rb_hash_aref(rb_options_hash, CSTR2SYM("transfer_progress"));
+	if (RTEST(val)) {
+		if (!rb_respond_to(val, rb_intern("call"))) {
+			rb_raise(rb_eArgError, "Expected a Proc or an object that responds to call (:transfer_progress).");
+		}
+
+		payload->transfer_progress = val;
+		callbacks->transfer_progress = rugged__remote_transfer_progress_cb;
+	}
+
+	val = rb_hash_aref(rb_options_hash, CSTR2SYM("update_tips"));
+	if (RTEST(val)) {
+		if (!rb_respond_to(val, rb_intern("call"))) {
+			rb_raise(rb_eArgError, "Expected a Proc or an object that responds to call (:update_tips).");
+		}
+
+		payload->update_tips = val;
+		callbacks->update_tips = rugged__remote_update_tips_cb;
+	}
+
+	callbacks->payload = payload;
+}
+
+/*
+ *  call-seq:
+ *    remote.fetch(refspecs = nil, options = {}) -> nil
+ *
+ *  Download new data from +remote+ and update tips.
+ *
+ *  Connects to +remote+, downloads data, disconnects, and updates the local remote-tracking
+ *  branches.
+ *
+ *  You can optionally pass in an alternative list of +refspecs+ to use instead of the fetch
+ *  refspecs setup for +remote+.
+ *
+ *  The following options can be passed in the +options+ Hash:
+ *
+ *  :credentials ::
+ *    The credentials to use for the fetch operation. Can be either an instance of one
+ *    of the Rugged::Credentials types, or a proc returning one of the former.
+ *    The proc will be called with the +url+, the +username+ from the url (if applicable) and
+ *    a list of applicable credential types.
+ *
+ *  :progress ::
+ *    A callback that will be executed with the textual progress received from the remote.
+ *    This is the text send over the progress side-band (ie. the "counting objects" output).
+ *
+ *  :transfer_progress ::
+ *    A callback that will be executed to report clone progress information. It will be passed
+ *    the amount of +total_objects+, +indexed_objects+, +received_objects+ and +received_bytes+.
+ *
+ *  :update_tips ::
+ *    A callback that will be executed each time a reference is updated locally. It will be
+ *    passed the +refname+, +old_oid+ and +new_oid+.
+ *
+ *  :message ::
+ *    A single line log message to be appended to the reflog of each local remote-tracking
+ *    branch that gets updated. Defaults to: "update by push".
+ *
+ *  :signature ::
+ *    The signature to be used for populating the reflog entries.
+ *
+ *  Example:
+ *
+ *    remote = Rugged::Remote.lookup(@repo, 'origin')
+ *    remote.fetch({
+ *      :transfer_progress => lambda { |total_objects, indexed_objects, received_objects, received_bytes|
+ *        # ...
+ *      }
+ *    })
+ */
+static VALUE rb_git_remote_fetch(int argc, VALUE *argv, VALUE self)
+{
+	VALUE rb_options, rb_refspecs, rb_val, rb_repo = rugged_owner(self);
+
+	git_repository *repo;
+	git_remote *remote, *tmp_remote;
+	git_remote_callbacks callbacks = GIT_REMOTE_CALLBACKS_INIT;
+	git_strarray refspecs;
+	git_signature *signature = NULL;
+
+	int error, has_custom_refspecs = 0;
+	char *log_message = NULL;
+
+	struct rugged_remote_cb_payload payload = { Qnil, Qnil, Qnil, Qnil, 0 };
+
+	rb_scan_args(argc, argv, "01:", &rb_refspecs, &rb_options);
+
+	has_custom_refspecs = !NIL_P(rb_refspecs);
+	rugged_rb_ary_to_strarray(rb_refspecs, &refspecs);
+
+	parse_fetch_options(&callbacks, rb_options, &payload);
+
+	rugged_check_repo(rb_repo);
+	Data_Get_Struct(rb_repo, git_repository, repo);
+	Data_Get_Struct(self, git_remote, remote);
+
+	if (!NIL_P(rb_options)) {
+		rb_val = rb_hash_aref(rb_options, CSTR2SYM("message"));
+		if (!NIL_P(rb_val))
+			log_message = StringValueCStr(rb_val);
+
+		rb_val = rb_hash_aref(rb_options, CSTR2SYM("signature"));
+		if (!NIL_P(rb_val))
+			signature = rugged_signature_get(rb_val, repo);
+	}
+
+	// Create a temporary remote that we use for fetching
+	error = git_remote_dup(&tmp_remote, remote);
+	rugged_exception_check(error);
+
+	error = git_remote_set_callbacks(tmp_remote, &callbacks);
+	if (error) goto cleanup;
+
+	if (has_custom_refspecs) {
+		error = git_remote_set_fetch_refspecs(tmp_remote, &refspecs);
+		if (error) goto cleanup;
+	}
+
+	error = git_remote_fetch(tmp_remote, signature, log_message);
+
+cleanup:
+	git_signature_free(signature);
+	git_remote_free(tmp_remote);
+	xfree(refspecs.strings);
+
+	if (RTEST(payload.exception))
+		rb_jump_tag(payload.exception);
+
+	rugged_exception_check(error);
+
+	return Qnil;
+}
+
+static void parse_push_options(git_remote_callbacks *callbacks, VALUE rb_options_hash, struct rugged_remote_cb_payload *payload)
+{
+	VALUE val;
+
+	if (NIL_P(rb_options_hash))
+		return;
+
+	val = rb_hash_aref(rb_options_hash, CSTR2SYM("credentials"));
+	if (RTEST(val)) {
+		if (rb_obj_is_kind_of(val, rb_cRuggedCredPlaintext) ||
+			rb_obj_is_kind_of(val, rb_cRuggedCredSshKey) ||
+			rb_obj_is_kind_of(val, rb_cRuggedCredDefault))
+		{
+			callbacks->credentials = rugged__default_remote_credentials_cb;
+			payload->credentials = val;
+		} else if (rb_respond_to(val, rb_intern("call"))) {
+			callbacks->credentials = rugged__remote_credentials_cb;
+			payload->credentials = val;
+		} else {
+			rb_raise(rb_eArgError,
+				"Expected a Rugged::Credentials type, a Proc or an object that responds to call (:credentials).");
+		}
+	}
+
+	callbacks->payload = payload;
+}
+
+static int rugged__push_status_cb(const char *ref, const char *msg, void *payload)
+{
+	VALUE rb_result_hash = (VALUE)payload;
+	if (msg != NULL)
+		rb_hash_aset(rb_result_hash, rb_str_new_utf8(ref), rb_str_new_utf8(msg));
+
+	return GIT_OK;
+}
+
+/*
+ *  call-seq:
+ *    remote.push(refspecs = nil, options = {}) -> hash
+ *
+ *  Pushes the given +refspecs+ to the given +remote+. Returns a hash that contains
+ *  key-value pairs that reflect pushed refs and error messages, if applicable.
+ *
+ *  The following options can be passed in the +options+ Hash:
+ *
+ *  :credentials ::
+ *    The credentials to use for the fetch operation. Can be either an instance of one
+ *    of the Rugged::Credentials types, or a proc returning one of the former.
+ *    The proc will be called with the +url+, the +username+ from the url (if applicable) and
+ *    a list of applicable credential types.
+ *
+ *  :message ::
+ *    A single line log message to be appended to the reflog of each local remote-tracking
+ *    branch that gets updated. Defaults to: "fetch".
+ *
+ *  :signature ::
+ *    The signature to be used for populating the reflog entries.
+ *
+ *  Example:
+ *
+ *    remote = Rugged::Remote.lookup(@repo, 'origin')
+ *    remote.push(["refs/heads/master", ":refs/heads/to_be_deleted"])
+ */
+static VALUE rb_git_remote_push(int argc, VALUE *argv, VALUE self)
+{
+	VALUE rb_refspecs, rb_options, rb_val;
+	VALUE rb_repo = rugged_owner(self);
+	VALUE rb_exception = Qnil, rb_result = rb_hash_new();
+
+	git_repository *repo;
+	git_remote *remote, *tmp_remote;
+	git_remote_callbacks callbacks = GIT_REMOTE_CALLBACKS_INIT;
+	git_push *push = NULL;
+	git_signature *signature = NULL;
+
+	int error = 0, i = 0;
+	char *log_message = NULL;
+
+	struct rugged_remote_cb_payload payload = { Qnil, Qnil, Qnil, Qnil, 0 };
+
+	rb_scan_args(argc, argv, "01:", &rb_refspecs, &rb_options);
+
+	Check_Type(rb_refspecs, T_ARRAY);
+	for (i = 0; i < RARRAY_LEN(rb_refspecs); ++i) {
+		VALUE rb_refspec = rb_ary_entry(rb_refspecs, i);
+		Check_Type(rb_refspec, T_STRING);
+	}
+
+	rugged_check_repo(rb_repo);
+	Data_Get_Struct(rb_repo, git_repository, repo);
+	Data_Get_Struct(self, git_remote, remote);
+
+	// Create a temporary remote that we use for pushing
+	error = git_remote_dup(&tmp_remote, remote);
+	rugged_exception_check(error);
+
+	parse_push_options(&callbacks, rb_options, &payload);
+	error = git_remote_set_callbacks(tmp_remote, &callbacks);
+	if (error) goto cleanup;
+
+	if (!NIL_P(rb_options)) {
+		rb_val = rb_hash_aref(rb_options, CSTR2SYM("message"));
+		if (!NIL_P(rb_val))
+			log_message = StringValueCStr(rb_val);
+
+		rb_val = rb_hash_aref(rb_options, CSTR2SYM("signature"));
+		if (!NIL_P(rb_val))
+			signature = rugged_signature_get(rb_val, repo);
+	}
+
+	error = git_push_new(&push, tmp_remote);
+	if (error) goto cleanup;
+
+	for (i = 0; !error && i < RARRAY_LEN(rb_refspecs); ++i) {
+		VALUE rb_refspec = rb_ary_entry(rb_refspecs, i);
+		error = git_push_add_refspec(push, StringValueCStr(rb_refspec));
+	}
+	if (error) goto cleanup;
+
+	error = git_push_finish(push);
+	if (error) goto cleanup;
+
+	if (!git_push_unpack_ok(push)) {
+		rb_exception = rb_exc_new2(rb_eRuggedError, "the remote side did not unpack successfully");
+		goto cleanup;
+	}
+
+	error = git_push_status_foreach(push, &rugged__push_status_cb, (void *)rb_result);
+	if (error) goto cleanup;
+
+	error = git_push_update_tips(push, signature, log_message);
+
+cleanup:
+	git_push_free(push);
+	git_remote_free(tmp_remote);
+	git_signature_free(signature);
+
+	if (!NIL_P(rb_exception))
+		rb_exc_raise(rb_exception);
+
+	rugged_exception_check(error);
+
+	return rb_result;
+}
+
 void Init_rugged_remote(void)
 {
 	rb_cRuggedRemote = rb_define_class_under(rb_mRugged, "Remote", rb_cObject);
@@ -717,8 +1099,6 @@ void Init_rugged_remote(void)
 	rb_define_singleton_method(rb_cRuggedRemote, "names", rb_git_remote_names, 1);
 	rb_define_singleton_method(rb_cRuggedRemote, "each", rb_git_remote_each, 1);
 
-	rb_define_method(rb_cRuggedRemote, "connect", rb_git_remote_connect, 1);
-	rb_define_method(rb_cRuggedRemote, "disconnect", rb_git_remote_disconnect, 0);
 	rb_define_method(rb_cRuggedRemote, "name", rb_git_remote_name, 0);
 	rb_define_method(rb_cRuggedRemote, "url", rb_git_remote_url, 0);
 	rb_define_method(rb_cRuggedRemote, "url=", rb_git_remote_set_url, 1);
@@ -728,11 +1108,11 @@ void Init_rugged_remote(void)
 	rb_define_method(rb_cRuggedRemote, "push_refspecs", rb_git_remote_push_refspecs, 0);
 	rb_define_method(rb_cRuggedRemote, "add_fetch", rb_git_remote_add_fetch, 1);
 	rb_define_method(rb_cRuggedRemote, "add_push", rb_git_remote_add_push, 1);
-	rb_define_method(rb_cRuggedRemote, "connected?", rb_git_remote_connected, 0);
 	rb_define_method(rb_cRuggedRemote, "ls", rb_git_remote_ls, 0);
-	rb_define_method(rb_cRuggedRemote, "download", rb_git_remote_download, 0);
-	rb_define_method(rb_cRuggedRemote, "update_tips!", rb_git_remote_update_tips, 0);
 	rb_define_method(rb_cRuggedRemote, "clear_refspecs", rb_git_remote_clear_refspecs, 0);
 	rb_define_method(rb_cRuggedRemote, "save", rb_git_remote_save, 0);
 	rb_define_method(rb_cRuggedRemote, "rename!", rb_git_remote_rename, 1);
+
+	rb_define_method(rb_cRuggedRemote, "fetch", rb_git_remote_fetch, -1);
+	rb_define_method(rb_cRuggedRemote, "push", rb_git_remote_push, -1);
 }
