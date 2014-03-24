@@ -288,7 +288,7 @@ static VALUE rb_git_repo_init_at(int argc, VALUE *argv, VALUE klass)
 static void parse_clone_options(git_clone_options *ret, VALUE rb_options_hash, struct rugged_remote_cb_payload *remote_payload)
 {
 	git_remote_callbacks remote_callbacks = GIT_REMOTE_CALLBACKS_INIT;
-	VALUE val, checkout_branch_val;
+	VALUE val;
 
 	if (NIL_P(rb_options_hash))
 		return;
@@ -297,9 +297,9 @@ static void parse_clone_options(git_clone_options *ret, VALUE rb_options_hash, s
 	if (RTEST(val))
 		ret->bare = 1;
 
-	checkout_branch_val = rb_hash_aref(rb_options_hash, CSTR2SYM("checkout_branch"));
-	if (RTEST(checkout_branch_val) && (TYPE(checkout_branch_val) == T_STRING))
-		ret->checkout_branch = StringValuePtr(checkout_branch_val);
+	val = rb_hash_aref(rb_options_hash, CSTR2SYM("checkout_branch"));
+	if (RTEST(val) && (TYPE(val) == T_STRING))
+		ret->checkout_branch = StringValuePtr(val);
 
 	parse_fetch_options(&remote_callbacks, rb_options_hash, remote_payload);
 
