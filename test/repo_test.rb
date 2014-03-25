@@ -452,37 +452,14 @@ class RepositoryCloneTest < Rugged::TestCase
   end
 
   def test_clone_with_branch
-    repo = Rugged::Repository.clone_at(@source_path, @tmppath, {:checkout_branch => "packed"})
+    repo = Rugged::Repository.clone_at(@source_path, @tmppath, {checkout_branch: "packed"})
     begin
       assert_equal "what file?\n", File.read(File.join(@tmppath, "second.txt"))
-      assert_equal "41bc8c69075bbdb46c5c6f0566cc8cc5b46e8bd9", repo.head.target_id
-      assert_equal "41bc8c69075bbdb46c5c6f0566cc8cc5b46e8bd9", repo.ref("refs/heads/packed").target_id
-      assert_equal "36060c58702ed4c2a40832c51758d5344201d89a", repo.ref("refs/remotes/origin/master").target_id
-      assert_equal "41bc8c69075bbdb46c5c6f0566cc8cc5b46e8bd9", repo.ref("refs/remotes/origin/packed").target_id
+      assert_equal repo.head.target_id, repo.ref("refs/heads/packed").target_id
+      assert_equal "refs/heads/packed", repo.references["HEAD"].target_id
     ensure
       repo.close
     end
-  end
-
-  def test_clone_with_update_tips_callback
-    calls = 0
-    updated_tips = {}
-
-    repo = Rugged::Repository.clone_at(@source_path, @tmppath, {
-      update_tips: lambda { |refname, a, b|
-        calls += 1
-        updated_tips[refname] = [a, b]
-      }
-    })
-    repo.close
-
-    assert_equal 4, calls
-    assert_equal({
-      "refs/remotes/origin/master" => [nil, "36060c58702ed4c2a40832c51758d5344201d89a"],
-      "refs/remotes/origin/packed" => [nil, "41bc8c69075bbdb46c5c6f0566cc8cc5b46e8bd9"],
-      "refs/tags/v0.9"             => [nil, "5b5b025afb0b4c913b4c338a42934a3863bf3644"],
-      "refs/tags/v1.0"             => [nil, "0c37a5391bbff43c37f0d0371823a5509eed5b1d"],
-    }, updated_tips)
   end
 
   def test_clone_quits_on_error

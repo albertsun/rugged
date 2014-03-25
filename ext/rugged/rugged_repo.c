@@ -298,8 +298,10 @@ static void parse_clone_options(git_clone_options *ret, VALUE rb_options_hash, s
 		ret->bare = 1;
 
 	val = rb_hash_aref(rb_options_hash, CSTR2SYM("checkout_branch"));
-	if (RTEST(val) && (TYPE(val) == T_STRING))
-		ret->checkout_branch = StringValuePtr(val);
+	if (!NIL_P(val)) {
+		Check_Type(val, T_STRING);
+		ret->checkout_branch = StringValueCStr(val);
+	}
 
 	parse_fetch_options(&remote_callbacks, rb_options_hash, remote_payload);
 
@@ -526,7 +528,7 @@ static VALUE rb_git_repo_merge_commits(int argc, VALUE *argv, VALUE self)
 	git_commit *our_commit, *their_commit;
 	git_index *index;
 	git_repository *repo;
-	git_merge_tree_opts opts = GIT_MERGE_TREE_OPTS_INIT;
+	git_merge_options opts = GIT_MERGE_OPTIONS_INIT;
 
 	rb_scan_args(argc, argv, "20:", &rb_our_commit, &rb_their_commit, &rb_options);
 
